@@ -1,11 +1,11 @@
 import os
 import tempfile
 import logging
-import whisper
 import asyncio
 from uuid import UUID
 from typing import Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
+from faster_whisper import WhisperModel
 from app.models.task import TaskStatus
 from app.services.supabase_service import supabase_service
 from app.config import settings
@@ -21,23 +21,28 @@ from utils.ffmpeg_utils import (
 logger = logging.getLogger(__name__)
 
 # Cache Whisper model globally to avoid reloading on every task
-_whisper_model_cache: Optional[object] = None
+_whisper_model_cache: Optional[WhisperModel] = None
 _whisper_model_size: Optional[str] = None
 
 
-def _load_whisper_model(model_size: str = "base"):
-    """Load and cache Whisper model"""
+def _load_whisper_model(model_size: str = "tiny"):
+    """Load and cache faster-whisper model"""
     global _whisper_model_cache, _whisper_model_size
 
     if _whisper_model_cache is None or _whisper_model_size != model_size:
-        logger.info(f"Loading Whisper model: {model_size}")
-        os.environ["WHISPER_CACHE_DIR"] = settings.whisper_model_cache_dir
+        logger.info(f"Loading faster-whisper model: {model_size}")
         import time
         start_time = time.time()
-        _whisper_model_cache = whisper.load_model(model_size, download_root=settings.whisper_model_cache_dir)
+        _whisper_model_cache = WhisperModel(
+            model_size,
+            device="cpu",
+            compute_type="int8",
+            download_root=settings.whisper_model_cache_dir,
+            num_workers=4
+        )
         load_time = time.time() - start_time
         _whisper_model_size = model_size
-        logger.info(f"Whisper model {model_size} loaded in {load_time:.2f}s")
+        logger.info(f"faster-whisper model {model_size} loaded in {load_time:.2f}s")
 
     return _whisper_model_cache
 
@@ -62,7 +67,7 @@ async def process_caption_task(task_id: UUID, task_data: Dict[str, Any]) -> None
         logger.info(f"[{task_id}] Status updated to RUNNING")
 
         video_url = task_data["video_url"]
-        model_size = "base"
+        model_size = "tiny"
 
         video_filename = f"{task_id}_input.mp4"
         video_path = os.path.join(tempfile.gettempdir(), video_filename)
@@ -85,27 +90,36 @@ async def process_caption_task(task_id: UUID, task_data: Dict[str, Any]) -> None
             logger.info(f"[{task_id}] Model ready, starting transcription...")
             import time
             transcribe_start = time.time()
-            result = await loop.run_in_executor(
-                executor,
-                lambda: model.transcribe(
+
+            def transcribe_with_faster_whisper():
+                segments, info = model.transcribe(
                     video_path,
-                    fp16=False,
                     language="en",
-                    verbose=False,
                     beam_size=1,
-                    best_of=1
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    condition_on_previous_text=False,
+                    temperature=0.0
                 )
-            )
+                result_segments = []
+                for segment in segments:
+                    result_segments.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text
+                    })
+                return result_segments
+
+            subtitles = await loop.run_in_executor(executor, transcribe_with_faster_whisper)
             transcribe_time = time.time() - transcribe_start
             logger.info(f"[{task_id}] Transcription took {transcribe_time:.2f}s")
 
-        logger.info(f"[{task_id}] Transcription complete, found {len(result['segments'])} segments")
-        subtitles = result["segments"]
+        logger.info(f"[{task_id}] Transcription complete, found {len(subtitles)} segments")
 
         if len(subtitles) == 0:
             logger.warning(f"[{task_id}] No speech detected in video!")
         else:
-            logger.info(f"[{task_id}] First subtitle: {subtitles[0].get('text', 'N/A')[:100]}...")
+            logger.info(f"[{task_id}] First subtitle: {subtitles[0]['text'][:100]}...")
 
         logger.info(f"[{task_id}] Generating SRT subtitles")
         srt_text = write_srt(subtitles, max_words_per_line=3)

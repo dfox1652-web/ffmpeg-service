@@ -5,9 +5,9 @@ nixPkgs = ["python311", "python311Packages.pip", "ffmpeg", "git"]
 cmds = [
   "echo '🚀 Installing dependencies...'",
   "pip install --break-system-packages -r requirements.txt",
-  "echo '📥 Pre-downloading Whisper base model...'",
-  "python -c 'import whisper; whisper.load_model(\"base\")'",
-  "echo '✅ Whisper model cached successfully'"
+  "echo '📥 Pre-downloading faster-whisper tiny model...'",
+  "python -c 'from faster_whisper import WhisperModel; WhisperModel(\"tiny\", device=\"cpu\", compute_type=\"int8\")'",
+  "echo '✅ faster-whisper model cached successfully'"
 ]
 
 [start]
